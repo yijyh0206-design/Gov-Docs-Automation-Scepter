@@ -1,0 +1,782 @@
+# -*- coding: utf-8 -*-
+"""
+gov_docs_batch_part23.py (v1.6.6)
+PART II：七類清單「同時／分別」匯入→一起轉檔
+PART III：A/F/G 與 B/F/G 去重
+PART IV：各單位 × A~G 件數統計表（最後一列「合計」），且第三列欄位已依需求改名
+PART V：將 A~G 清單 + PART IV 統計 合併輸出成單一 Excel 檔
+       - 不凍結
+       - 自動欄寬
+       - 文字自動換行＋頂端對齊
+       - 前三列粗體、淺藍底色(#D9E1F2)
+       - 第 1 列合併置中；第 2 列合併靠左
+       - 所有儲存格加邊框
+       - 列高隨內容自動調整
+"""
+
+import os
+import datetime as dt
+from typing import Dict, Tuple, List, Optional
+
+import pandas as pd
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+import sys
+
+def resource_path(rel_path: str) -> str:
+    """
+    取得打包後 exe 內的資源路徑
+    rel_path: 資源檔相對路徑（例如 'YilanGov_LOGO.png'）
+    """
+    base = getattr(sys, "_MEIPASS", os.path.abspath("."))
+    return os.path.join(base, rel_path)
+
+# --- 可選：chardet 幫忙偵測編碼 ---
+try:
+    import chardet
+    HAVE_CHARDET = True
+except Exception:
+    HAVE_CHARDET = False
+
+
+# ================= 共用工具 =================
+
+NAME_MAP = {
+    "A": "一般公文",
+    "B": "人民申請案公文",
+    "C": "陳情案公文",
+    "D": "訴願案公文",
+    "E": "專案公文",
+    "F": "限期公文",
+    "G": "特殊性案件公文",
+}
+
+# 第一列固定標題字串
+FIRST_TITLES = {
+    "A": "宜蘭縣政府及所屬機關一般公文逾期6天以上未結案件",
+    "B": "宜蘭縣政府及所屬機關人民申請公文逾期6天以上未結案件",
+    "C": "宜蘭縣政府及所屬機關陳情公文逾期6天以上未結案件",
+    "D": "宜蘭縣政府及所屬機關訴願公文逾期1天以上未結案件",
+    "E": "宜蘭縣政府及所屬機關專案公文逾期1天以上未結案件",
+    "F": "宜蘭縣政府及所屬機關限期公文逾期1天以上未結案件",
+    "G": "宜蘭縣政府及所屬機關特殊性案件公文逾期1天以上未結案件",
+}
+
+def roc_today_str() -> str:
+    d = dt.date.today()
+    return f"{d.year - 1911:03d}{d.month:02d}{d.day:02d}"
+
+def second_title_row() -> str:
+    d = dt.date.today()
+    return f"截至  {d.year - 1911} 年  {d.month:02d} 月  {d.day:02d} 日止未結案"
+
+def detect_encoding(path: str) -> str:
+    if not HAVE_CHARDET:
+        return "utf-8-sig"
+    with open(path, "rb") as f:
+        raw = f.read(200000)
+    enc = chardet.detect(raw).get("encoding") or "utf-8-sig"
+    return enc
+
+def read_csv_safely(path: str) -> pd.DataFrame:
+    enc = detect_encoding(path)
+    try:
+        return pd.read_csv(path, encoding=enc)
+    except Exception:
+        return pd.read_csv(path, encoding="big5", errors="ignore")
+
+def normalize_str_series(s: pd.Series) -> pd.Series:
+    return s.fillna("").astype(str).str.strip()
+
+
+# ================= 承辦單位筆劃排序 =================
+
+_STROKES: Dict[str, int] = {
+    "一": 1, "丨": 1, "丶": 1, "丿": 1, "乙": 1, "亅": 1,
+    "人": 2, "入": 2, "八": 2, "十": 2, "丁": 2, "二": 2,
+    "工": 3, "山": 3, "川": 3, "己": 3, "已": 3, "土": 3, "士": 3,
+    "大": 3, "女": 3, "子": 3, "小": 3, "口": 3,
+    "交": 6, "地": 6, "壯": 7, "社": 7, "宜": 8, "長": 8,
+    "建": 9, "南": 9, "政": 9, "計": 9, "縣": 9,
+    "原": 10, "員": 10, "家": 10, "海": 10, "消": 10, "秘": 10,
+    "動": 11, "教": 11, "勞": 11,
+    "農": 13, "殯": 14, "衛": 16, "樹": 16, "頭": 16,
+    "環": 17, "礁": 18, "蘇": 19, "警": 19, "蘭": 20, "體": 23,
+    "水": 4, "民": 5, "文": 4, "戶": 4, "旅": 10, "處": 11, "局": 7, "所": 8, "館": 16, "場": 12,
+}
+def est_strokes(name: str) -> int:
+    if not name:
+        return 0
+    ch = name[0]
+    if ch in _STROKES:
+        return _STROKES[ch]
+    return 30 + (ord(ch) % 1000)  # fallback
+
+def sort_key_by_unit(name: str):
+    return (est_strokes(name), name)
+
+
+# ================= 清整／排序 helper =================
+
+def drop_columns_by_label_ordered(df: pd.DataFrame, drops: List[str]) -> pd.DataFrame:
+    exist = [c for c in drops if c in df.columns]
+    return df.drop(columns=exist)
+
+def rename_columns(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
+    cols = {c: mapping[c] for c in df.columns if c in mapping}
+    return df.rename(columns=cols)
+
+def detect_overdue_column(df: pd.DataFrame) -> Optional[str]:
+    for c in df.columns:
+        if "逾期天數" in c:
+            return c
+    return None
+
+def sort_multi(df: pd.DataFrame) -> pd.DataFrame:
+    od = detect_overdue_column(df)
+    if od is not None:
+        df[od] = pd.to_numeric(df[od], errors="coerce").fillna(0)
+    if "承辦單位" in df.columns:
+        df["_unit_key1"] = df["承辦單位"].map(lambda x: sort_key_by_unit(str(x)))
+        if od is not None:
+            df.sort_values(by=["_unit_key1", od, "公文文號"],
+                           ascending=[True, False, True], inplace=True, kind="mergesort")
+        else:
+            df.sort_values(by=["_unit_key1", "公文文號"],
+                           ascending=[True, True], inplace=True, kind="mergesort")
+        df.drop(columns=["_unit_key1"], inplace=True)
+    else:
+        if od is not None:
+            df.sort_values(by=[od, "公文文號"], ascending=[False, True], inplace=True, kind="mergesort")
+    return df
+
+def filter_by_overdue(df: pd.DataFrame, min_days: int, inclusive: bool = False) -> pd.DataFrame:
+    """
+    inclusive=True  -> 取 >= min_days
+    inclusive=False -> 取 >  min_days（預設）
+    """
+    col = detect_overdue_column(df)
+    if col is None:
+        return df
+    s = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    if inclusive:
+        return df[s >= min_days]
+    return df[s > min_days]
+
+def reindex_serial(df: pd.DataFrame) -> pd.DataFrame:
+    if "序號" in df.columns:
+        df = df.drop(columns=["序號"])
+    df.insert(0, "序號", range(1, len(df) + 1))
+    return df
+
+def add_three_header_rows(df: pd.DataFrame, type_key: str) -> pd.DataFrame:
+    """第1列=各類型固定標題；第2列=截至日期；第3列=欄位標題；第4列起=資料"""
+    cols = list(df.columns)
+    t1_text = FIRST_TITLES.get(type_key, f"宜蘭縣政府及所屬機關{NAME_MAP.get(type_key,'')}逾期案件清單")
+    t2_text = second_title_row()
+    t1 = pd.DataFrame([[t1_text] + [""] * (len(cols) - 1)], columns=cols)
+    t2 = pd.DataFrame([[t2_text] + [""] * (len(cols) - 1)], columns=cols)
+    header_row = pd.DataFrame([cols], columns=cols)
+    return pd.concat([t1, t2, header_row, df], ignore_index=True)
+
+def fill_org_if_blank(df: pd.DataFrame) -> pd.DataFrame:
+    if "來文機關" in df.columns:
+        col = normalize_str_series(df["來文機關"])
+        df["來文機關"] = col.where(col != "", "創簽稿")
+    return df
+
+
+# ================= A~G 類別處理 =================
+
+def process_A(df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
+    df = drop_columns_by_label_ordered(df, ["cUNIT_NAME_PRI", "速別", "主旨", "iGDOC_OVER_DAY", "cGDOC_EXTEND"])
+    df = rename_columns(df, {
+        "cUNIT_NAME": "承辦單位",
+        "cUSER_NAME_PRI": "承辦人",
+        "cGDOC_SUBJECT": "主旨",
+        "cGDOC_ORGNAME": "來文機關",
+        "cGDOC_SPEED": "速別",
+        "dGDOC_LIMITDATE_EXT": "計入展期之限辦日期",
+        "Textbox76": "逾期天數（扣除展期天數）",
+    })
+    df = fill_org_if_blank(df)
+    df = sort_multi(df)
+    df = filter_by_overdue(df, 5, inclusive=False)  # >5
+    df = reindex_serial(df)
+    return df, FIRST_TITLES["A"]
+
+def process_B(df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
+    df = drop_columns_by_label_ordered(df, ["cUNIT_NAME_PRI", "主旨", "iGDOC_OVER_DAY", "cGDOC_EXTEND",
+                                           "Textbox6", "Textbox76", "Textbox215"])
+    df = rename_columns(df, {
+        "cUNIT_NAME": "承辦單位",
+        "cUSER_NAME_PRI": "承辦人",
+        "cGDOC_SUBJECT": "主旨",
+        "cSCODE_DATA": "公文次性質",
+        "cGDOC_ORGNAME": "來文機關",
+        "速別": "辦理期限",
+        "dGDOC_LIMITDATE_EXT": "計入展期之限辦日期",
+        "cGDOC_SUBT_DATE2": "通知補正日期(補正結束日期)",
+        "cGDOC_SUBT_MEMO2": "補正情形",
+        "iGDOC_SUBT_DAY": "補正天數",
+        "Textbox211": "逾期天數 (扣除展期及補正天數)",
+    })
+    cols = list(df.columns)
+    if "公文文號" in cols and "收創日期" in cols:
+        idx = cols.index("公文文號") + 1
+        df.insert(idx, "續辦文號", "")
+    df = sort_multi(df)
+    df = filter_by_overdue(df, 5, inclusive=False)
+    df = reindex_serial(df)
+    return df, FIRST_TITLES["B"]
+
+def process_C(df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
+    df = drop_columns_by_label_ordered(df, ["cUNIT_NAME_PRI", "cSCODE_DATA", "速別", "主旨", "iGDOC_OVER_DAY", "cGDOC_EXTEND"])
+    df = rename_columns(df, {
+        "cUNIT_NAME": "承辦單位",
+        "cUSER_NAME_PRI": "承辦人",
+        "cGDOC_SUBJECT": "主旨",
+        "cGDOC_ORGNAME": "來文機關",
+        "cGDOC_CTRL": "列管字號",
+        "dGDOC_LIMITDATE_EXT": "計入展期之限辦日期",
+        "Textbox76": "逾期天數（扣除展期天數）",
+    })
+    df = sort_multi(df)
+    df = filter_by_overdue(df, 5, inclusive=False)  # >5
+    df = reindex_serial(df)
+    return df, FIRST_TITLES["C"]
+
+def process_D(df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
+    df = drop_columns_by_label_ordered(df, ["cUNIT_NAME_PRI", "cGDOC_SPEED", "速別", "主旨", "iGDOC_OVER_DAY", "cGDOC_EXTEND"])
+    df = rename_columns(df, {
+        "cUNIT_NAME": "承辦單位",
+        "cUSER_NAME_PRI": "承辦人",
+        "cGDOC_SUBJECT": "主旨",
+        "cGDOC_ORGNAME": "來文機關",
+        "dGDOC_LIMITDATE_EXT": "計入展期之限辦日期",
+        "Textbox76": "逾期天數（扣除展期天數）",
+    })
+    df = sort_multi(df)
+    df = reindex_serial(df)
+    return df, FIRST_TITLES["D"]
+
+def process_E(df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
+    df = drop_columns_by_label_ordered(df, ["cUNIT_NAME_PRI", "cGDOC_SPEED", "速別", "主旨", "iGDOC_OVER_DAY", "cGDOC_EXTEND"])
+    df = rename_columns(df, {
+        "cUNIT_NAME": "承辦單位",
+        "cUSER_NAME_PRI": "承辦人",
+        "cGDOC_SUBJECT": "主旨",
+        "cGDOC_ORGNAME": "來文機關",
+        "dGDOC_LIMITDATE_EXT": "計入展期之限辦日期",
+        "Textbox76": "逾期天數（扣除展期天數）",
+    })
+    df = fill_org_if_blank(df)
+    df = sort_multi(df)
+    df = reindex_serial(df)
+    return df, FIRST_TITLES["E"]
+
+def process_F(df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
+    df = drop_columns_by_label_ordered(df, ["cUNIT_NAME_PRI", "cGDOC_SPEED", "速別", "主旨", "iGDOC_OVER_DAY", "cGDOC_EXTEND"])
+    df = rename_columns(df, {
+        "cUNIT_NAME": "承辦單位",
+        "cUSER_NAME_PRI": "承辦人",
+        "cGDOC_SUBJECT": "主旨",
+        "cGDOC_ORGNAME": "來文機關",
+        "dGDOC_LIMITDATE_EXT": "計入展期之限辦日期",
+        "Textbox76": "逾期天數（扣除展期天數）",
+    })
+    df = sort_multi(df)
+    df = reindex_serial(df)
+    return df, FIRST_TITLES["F"]
+
+def process_G(df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
+    df = drop_columns_by_label_ordered(df, ["cUNIT_NAME_PRI", "cGDOC_SPEED", "速別", "主旨", "iGDOC_OVER_DAY", "cGDOC_EXTEND"])
+    df = rename_columns(df, {
+        "cUNIT_NAME": "承辦單位",
+        "cUSER_NAME_PRI": "承辦人",
+        "cGDOC_SUBJECT": "主旨",
+        "cGDOC_ORGNAME": "來文機關",
+        "dGDOC_LIMITDATE_EXT": "計入展期之限辦日期",
+        "Textbox76": "逾期天數（扣除展期天數）",
+    })
+    df = fill_org_if_blank(df)
+    df = sort_multi(df)
+    df = reindex_serial(df)
+    return df, FIRST_TITLES["G"]
+
+PROCESSORS = {
+    "A": process_A, "B": process_B, "C": process_C, "D": process_D,
+    "E": process_E, "F": process_F, "G": process_G,
+}
+
+
+# ================= PART III 去重 =================
+
+def dedup_part3(dfs: Dict[str, pd.DataFrame], log) -> Dict[str, pd.DataFrame]:
+    def get_set(key: str) -> set:
+        if key not in dfs or dfs[key] is None or dfs[key].empty:
+            return set()
+        if "公文文號" not in dfs[key].columns:
+            return set()
+        return set(normalize_str_series(dfs[key]["公文文號"]).tolist())
+
+    A_set, B_set, F_set, G_set = (get_set("A"), get_set("B"), get_set("F"), get_set("G"))
+
+    # 1) 刪 A：若出現在 F 或 G
+    remove_in_A = (A_set & F_set) | (A_set & G_set)
+    if remove_in_A and "A" in dfs and not dfs["A"].empty and "公文文號" in dfs["A"].columns:
+        before = len(dfs["A"])
+        dfs["A"] = dfs["A"][~dfs["A"]["公文文號"].astype(str).isin(remove_in_A)].copy()
+        dfs["A"] = reindex_serial(dfs["A"])
+        log(f"PART III：A 與 F/G 去重，從 A 刪除 {before - len(dfs['A'])} 筆。")
+
+    # 2) 刪 F/G：若出現在 B
+    if B_set:
+        for key in ("F", "G"):
+            if key in dfs and dfs[key] is not None and not dfs[key].empty and "公文文號" in dfs[key].columns:
+                before = len(dfs[key])
+                dfs[key] = dfs[key][~dfs[key]["公文文號"].astype(str).isin(B_set)].copy()
+                dfs[key] = reindex_serial(dfs[key])
+                log(f"PART III：{key} 與 B 去重，從 {key} 刪除 {before - len(dfs[key])} 筆。")
+
+    return dfs
+
+
+# ================= PART IV 統計（各單位 × A~G，含合計列） =================
+
+PART4_COLS = [
+    ("A", "A_一般"),
+    ("B", "B_人民申請"),
+    ("C", "C_陳情"),
+    ("D", "D_訴願"),
+    ("E", "E_專案"),
+    ("F", "F_限期"),
+    ("G", "G_特殊性"),
+]
+
+# 欄位改名對照表（輸出統計表第三列欄位名）
+PART4_HEADER_RENAME = {
+    "承辦單位": "機關(單位)",
+    "A_一般": "一般公文(件數)",
+    "B_人民申請": "人民申請(件數)",
+    "C_陳情": "陳情案件(件數)",
+    "D_訴願": "訴願案件(件數)",
+    "E_專案": "專案管制案件(件數)",
+    "F_限期": "限期公文案件(件數)",
+    "G_特殊性": "特殊性案件(件數)",
+}
+
+def build_part4_summary(dfs: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    units = set()
+    for k, df in dfs.items():
+        if df is None or df.empty:
+            continue
+        if "承辦單位" in df.columns:
+            units |= set(df["承辦單位"].dropna().astype(str))
+
+    if not units:
+        return pd.DataFrame(columns=["承辦單位"] + [cn for _, cn in PART4_COLS]).rename(columns=PART4_HEADER_RENAME)
+
+    data = {"承辦單位": sorted(list(units), key=lambda x: sort_key_by_unit(x))}
+    for _, cn in PART4_COLS:
+        data[cn] = [0] * len(data["承辦單位"])
+    out = pd.DataFrame(data)
+
+    for k, cn in PART4_COLS:
+        if k in dfs and dfs[k] is not None and not dfs[k].empty and "承辦單位" in dfs[k].columns:
+            counts = dfs[k]["承辦單位"].value_counts()
+            out[cn] = out["承辦單位"].map(lambda u: int(counts.get(u, 0)))
+
+    has_any = out[[cn for _, cn in PART4_COLS]].sum(axis=1) > 0
+    out = out[has_any].copy()
+
+    total_row = {"承辦單位": "合計"}
+    for _, cn in PART4_COLS:
+        total_row[cn] = int(out[cn].sum()) if not out.empty else 0
+    out = pd.concat([out, pd.DataFrame([total_row])], ignore_index=True)
+
+    return out.rename(columns=PART4_HEADER_RENAME)
+
+def add_title_three_rows_part4(df_stat: pd.DataFrame) -> pd.DataFrame:
+    cols = list(df_stat.columns)
+    t1 = pd.DataFrame([["本府及所屬一、二級機關公文逾限一覽表"] + [""] * (len(cols) - 1)], columns=cols)
+    t2 = pd.DataFrame([[second_title_row()] + [""] * (len(cols) - 1)], columns=cols)
+    header_row = pd.DataFrame([cols], columns=cols)
+    return pd.concat([t1, t2, header_row, df_stat], ignore_index=True)
+
+
+# ================= PART V：合併成單一 Excel（樣式＋邊框＋自動列高） =================
+
+SHEET_NAME_MAP = {
+    "PART4": "本府及所屬一、二級機關公文逾限一覽表",
+    "A": "一般公文逾期6天以上未結案",
+    "B": "人民申請逾期6天以上未結案",
+    "F": "限期公文逾期1天以上未結案",
+    "G": "特殊性案件逾期1天以上未結案",
+    "D": "訴願案件逾期1天以上未結案",
+    "C": "陳情逾期6天以上未結案",
+    "E": "專案公文逾期1天以上未結案",
+}
+
+
+def safe_sheet_name(name: str) -> str:
+    """Excel 工作表名最長 31 字元；重複或過長時做裁切/去非法字元。"""
+    invalid = set(r'[]:*?/\\')
+    cleaned = ''.join(ch for ch in name if ch not in invalid)
+    return cleaned[:31] if len(cleaned) > 31 else cleaned
+
+def save_to_single_excel(sheets: Dict[str, pd.DataFrame], outdir: str, roc: str, log):
+    """
+    sheets: {"A": df_with_headers, ..., "PART4": df_with_headers}
+    匯出成 Excel：
+      - 不凍結
+      - 自動欄寬
+      - 文字自動換行、垂直頂端
+      - 前三列：粗體、淺藍底色(#D9E1F2)
+      - 第 1 列合併置中；第 2 列合併靠左
+      - 所有儲存格加邊框
+      - 自動列高（依內容換行）
+    """
+    if not sheets:
+        log("PART V：沒有可匯出的工作表，略過合併 Excel。")
+        return
+
+    xlsx_name = f"{roc}_公文清單_彙整.xlsx"
+    xlsx_path = os.path.join(outdir, xlsx_name)
+
+    import openpyxl
+    from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    thin_border = Border(
+        left=Side(style="thin", color="000000"),
+        right=Side(style="thin", color="000000"),
+        top=Side(style="thin", color="000000"),
+        bottom=Side(style="thin", color="000000")
+    )
+
+    with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+        # 1) 寫入所有工作表（DataFrame 已含三列表頭，不再額外加 header）
+        for key, df in sheets.items():
+            if df is None or df.empty:
+                continue
+            sheet_title = SHEET_NAME_MAP.get(key, key)
+            sheet_name = safe_sheet_name(sheet_title)
+            df.to_excel(writer, sheet_name=sheet_name, index=False, header=False)
+
+        wb = writer.book
+        header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+
+        for ws in wb.worksheets:
+            max_col = ws.max_column
+
+            # 2-1) 全表格：換行 + 垂直頂端 + 邊框
+            for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=max_col):
+                for cell in row:
+                    cur = cell.alignment or Alignment()
+                    cell.alignment = Alignment(horizontal=cur.horizontal, vertical="top", wrap_text=True)
+                    cell.border = thin_border
+
+            # 2-2) 自動欄寬（以最長字元數估算）
+            for col_idx in range(1, max_col + 1):
+                col_letter = get_column_letter(col_idx)
+                max_len = 0
+                for cell in ws[col_letter]:
+                    if cell.value is None:
+                        continue
+                    s = str(cell.value)
+                    max_len = max(max_len, len(s))
+                ws.column_dimensions[col_letter].width = max(8, min(80, max_len + 2))
+
+            # 2-3) 表頭底色 & 字型（第 1~3 列）
+            for r in range(1, min(3, ws.max_row) + 1):
+                for c in ws[r]:
+                    c.font = Font(bold=True)
+                    c.fill = header_fill
+
+            # 2-4) 合併：第 1 列整列置中；第 2 列整列靠左
+            if ws.max_row >= 1:
+                ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max_col)
+                a1 = ws["A1"]
+                a1.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                a1.font = Font(bold=True)
+                a1.fill = header_fill
+                a1.border = thin_border
+            if ws.max_row >= 2:
+                ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=max_col)
+                a2 = ws["A2"]
+                a2.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+                a2.font = Font(bold=True)
+                a2.fill = header_fill
+                a2.border = thin_border
+
+            # 2-5) 第 3 列標題置中（不合併）
+            if ws.max_row >= 3:
+                for cell in ws[3]:
+                    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                    cell.font = Font(bold=True)
+                    cell.fill = header_fill
+
+            # 2-6) 自動列高（粗估：每 ~30 字 ≈ 一行；最小 22、最大 180）
+            for r in range(1, ws.max_row + 1):
+                max_len = 0
+                for c in ws[r]:
+                    if c.value:
+                        chunks = str(c.value).split("\n")
+                        max_len = max(max_len, max(len(x) for x in chunks))
+                est_height = (max_len // 30 + 1) * 16
+                ws.row_dimensions[r].height = max(22, min(180, est_height))
+
+    log(f"PART V：已合併輸出 Excel（全欄邊框＋表頭樣式）：{xlsx_path}")
+
+
+# ================= GUI =================
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("管制考核科一隻公文轉檔小助手 v1.6.6")
+        # 圖示容錯：找不到就略過
+        try:
+            icon = tk.PhotoImage(file=resource_path("YilanGov_LOGO.png"))
+            self.iconphoto(True, icon)
+        except Exception:
+            pass
+
+        self.geometry("1160x680")
+        self.minsize(1100, 620)
+
+        self.var_enable = {k: tk.BooleanVar(value=True) for k in "ABCDEFG"}
+        self.var_path = {k: tk.StringVar() for k in "ABCDEFG"}
+        self.var_outdir = tk.StringVar(value=os.path.expanduser("~"))
+
+        self._build_ui()
+
+    # ---- 版面 ----
+    def _build_ui(self):
+        left = ttk.LabelFrame(self, text="檔案設定")
+        left.place(x=10, y=10, width=720, height=340)
+
+        ttk.Label(left, text="啟用", width=4).grid(row=0, column=0, padx=5, pady=5)
+        ttk.Label(left, text="類別", width=12).grid(row=0, column=1, padx=5, pady=5)
+        ttk.Label(left, text="CSV 檔案").grid(row=0, column=2, padx=5, pady=5)
+        ttk.Label(left, text="瀏覽", width=6).grid(row=0, column=3, padx=5, pady=5)
+
+        for r, k in enumerate("ABCDEFG", start=1):
+            ttk.Checkbutton(left, variable=self.var_enable[k]).grid(row=r, column=0, padx=5, pady=6)
+            ttk.Label(left, text=f"{k} {NAME_MAP[k]}", width=16).grid(row=r, column=1, sticky="w", padx=5)
+            ttk.Entry(left, textvariable=self.var_path[k]).grid(row=r, column=2, sticky="ew", padx=5)
+            ttk.Button(left, text="瀏覽", command=lambda key=k: self.browse_file(key), width=6).grid(row=r, column=3, padx=5)
+        left.columnconfigure(2, weight=1)
+
+        out = ttk.LabelFrame(self, text="輸出設定")
+        out.place(x=10, y=360, width=720, height=90)
+        ttk.Label(out, text="輸出資料夾：").grid(row=0, column=0, padx=6, pady=8)
+        ttk.Entry(out, textvariable=self.var_outdir).grid(row=0, column=1, sticky="ew", padx=6, pady=8)
+        ttk.Button(out, text="瀏覽", command=self.browse_dir, width=6).grid(row=0, column=2, padx=6, pady=8)
+        out.columnconfigure(1, weight=1)
+
+        # 自訂按鈕樣式
+        self.style = ttk.Style()
+        self.style.theme_use("default")
+        self.style.configure("Blue.TButton",  foreground="white", background="#1e88e5", relief="flat")
+        self.style.map("Blue.TButton",  background=[("active", "#1565c0")])
+        self.style.configure("Green.TButton", foreground="white", background="#2e7d32", relief="flat")
+        self.style.map("Green.TButton", background=[("active", "#1b5e20")])
+        self.style.configure("Gray.TButton",  foreground="white", background="#616161", relief="flat")
+        self.style.map("Gray.TButton",  background=[("active", "#424242")])
+        self.style.configure("Red.TButton",   foreground="white", background="#c62828", relief="flat")
+        self.style.map("Red.TButton",   background=[("active", "#8e0000")])
+
+        btns = ttk.Frame(self)
+        btns.place(x=10, y=460, width=720, height=60)
+        ttk.Button(btns, text="驗證匯入", style="Blue.TButton", command=self.validate_inputs).pack(side="left", padx=6)
+        ttk.Button(btns, text="轉檔（勾選）", style="Green.TButton", command=self.convert_selected).pack(side="left", padx=6)
+        ttk.Button(btns, text="只做去重（不輸出）", style="Gray.TButton", command=self.only_dedup).pack(side="left", padx=6)
+        ttk.Button(btns, text="清除", style="Red.TButton", command=self.clear_fields).pack(side="left", padx=6)
+        ttk.Button(btns, text="關閉", style="Gray.TButton", command=self.destroy).pack(side="right", padx=6)
+
+        # 右側日誌
+        self.right = ttk.LabelFrame(self, text="處理日誌")
+        self.right.place(x=740, y=10, width=410, height=650)
+        self.logbox = tk.Text(self.right, font=("Consolas", 10))
+        self.logbox.pack(fill="both", expand=True)
+
+        self.bind("<Configure>", self._on_resize)
+        self.log("請為 A~G 各別選擇 CSV；勾選要處理的清單，設定輸出資料夾後按「轉檔（勾選）」。")
+
+    def _on_resize(self, event=None):
+        try:
+            LEFT_TOTAL_WIDTH = 720 + 10
+            margin = 10
+            top_margin = 10
+            bottom_margin = 10
+            w = self.winfo_width()
+            h = self.winfo_height()
+            right_x = LEFT_TOTAL_WIDTH
+            right_y = top_margin
+            right_w = max(320, w - right_x - margin)
+            right_h = max(260, h - top_margin - bottom_margin)
+            self.right.place(x=right_x, y=right_y, width=right_w, height=right_h)
+        except Exception:
+            pass
+
+    # ---- 小工具 ----
+    def log(self, msg: str):
+        ts = dt.datetime.now().strftime("%H:%M:%S")
+        self.logbox.insert("end", f"[{ts}] {msg}\n")
+        self.logbox.see("end")
+        self.update_idletasks()
+
+    def browse_file(self, key: str):
+        path = filedialog.askopenfilename(
+            title=f"選擇 {NAME_MAP[key]} CSV",
+            filetypes=[("CSV", "*.csv"), ("All", "*.*")]
+        )
+        if path:
+            self.var_path[key].set(path)
+
+    def browse_dir(self):
+        d = filedialog.askdirectory(title="選擇輸出資料夾")
+        if d:
+            self.var_outdir.set(d)
+
+    def clear_fields(self):
+        for k in "ABCDEFG":
+            self.var_path[k].set("")
+            self.var_enable[k].set(True)
+        self.logbox.delete("1.0", "end")
+        self.log("已清除。")
+
+    def validate_inputs(self):
+        ok = True
+        for k in "ABCDEFG":
+            if self.var_enable[k].get():
+                p = self.var_path[k].get().strip()
+                if not p or not os.path.exists(p):
+                    ok = False
+                    self.log(f"{k} 未選檔或檔案不存在。")
+        if not os.path.isdir(self.var_outdir.get().strip()):
+            ok = False
+            self.log("輸出資料夾不存在。")
+        if ok:
+            self.log("驗證通過。")
+        else:
+            messagebox.showwarning("驗證未通過", "請檢查上方紅字訊息。")
+
+    # ---- 主流程 ----
+    def _load_and_process(self, key: str) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+        if not self.var_enable[key].get():
+            return None, None
+        path = self.var_path[key].get().strip()
+        if not path:
+            return None, None
+        try:
+            df_raw = read_csv_safely(path)
+            self.log(f"{key} 已讀：{path}，{len(df_raw)} 筆")
+            for c in df_raw.select_dtypes(include=["object"]).columns:
+                df_raw[c] = normalize_str_series(df_raw[c])
+            df, first_title = PROCESSORS[key](df_raw)
+            self.log(f"{key} 轉換成功：{NAME_MAP[key]}，{len(df)} 筆")
+            return df, first_title
+        except Exception as e:
+            self.log(f"{key} 讀取或轉換失敗：{e}")
+            return None, None
+
+    def convert_selected(self):
+        outdir = self.var_outdir.get().strip()
+        if not os.path.isdir(outdir):
+            messagebox.showerror("錯誤", "輸出資料夾不存在")
+            return
+
+        # PART II：讀入→轉換（不加三列）
+        dfs: Dict[str, pd.DataFrame] = {}
+        first_titles: Dict[str, str] = {}
+        for k in "ABCDEFG":
+            df, first_title = self._load_and_process(k)
+            if df is not None and not df.empty:
+                dfs[k] = df
+                first_titles[k] = first_title
+        if not dfs:
+            self.log("沒有任何清單讀入成功。")
+            return
+
+        # PART III：交互去重
+        dfs = dedup_part3(dfs, self.log)
+
+        # === 準備 CSV 與 Excel 的資料（先加三列，再各自輸出）===
+        roc = roc_today_str()
+        excel_sheets: Dict[str, pd.DataFrame] = {}  # for PART V
+
+        # 各清單輸出 CSV + 收集進 Excel
+        for k, df in dfs.items():
+            if df is None or df.empty:
+                continue
+            final_df = add_three_header_rows(df, k)
+            # CSV
+            fname = f"{roc}_{first_titles.get(k, FIRST_TITLES.get(k, NAME_MAP.get(k,'清單')))}.csv"
+            opath = os.path.join(outdir, fname)
+            final_df.to_csv(opath, index=False, header=False, encoding="utf-8-sig")
+            self.log(f"{k} 已輸出：{opath}")
+            # 收集給 Excel（工作表）
+            excel_sheets[k] = final_df
+
+        # PART IV：各單位 × A~G 件數統計表（改名 + 三列）
+        try:
+            part4 = build_part4_summary(dfs)
+            if part4 is not None and not part4.empty:
+                part4_final = add_title_three_rows_part4(part4)
+                p4name = f"{roc}_各單位_公文案件數量統計彙整.csv"
+                p4path = os.path.join(outdir, p4name)
+                part4_final.to_csv(p4path, index=False, header=False, encoding="utf-8-sig")
+                self.log(f"PART IV 統計已輸出：{p4path}")
+                excel_sheets["PART4"] = part4_final
+            else:
+                self.log("PART IV：統計結果為空，未輸出統計表。")
+        except Exception as e:
+            self.log(f"PART IV：統計失敗：{e}")
+
+        # PART V：合併成單一 Excel（樣式＋邊框＋列高自動）
+        try:
+            save_to_single_excel(excel_sheets, outdir, roc, self.log)
+        except Exception as e:
+            self.log(f"PART V：Excel 合併失敗：{e}")
+
+        self.log("全部完成。")
+
+    def only_dedup(self):
+        # 僅做去重預覽（不輸出）
+        dfs: Dict[str, pd.DataFrame] = {}
+        for k in "ABCDEFG":
+            df, _ = self._load_and_process(k)
+            if df is not None and not df.empty:
+                dfs[k] = df
+        if not dfs:
+            self.log("沒有任何清單讀入成功。")
+            return
+        before = {k: len(v) for k, v in dfs.items()}
+        dfs2 = dedup_part3(dfs, self.log)
+        after = {k: len(v) for k, v in dfs2.items()}
+        self.log("去重前後筆數：")
+        for k in "ABCDEFG":
+            if k in before:
+                self.log(f"  {k}：{before[k]} → {after.get(k, 0)}")
+        # PART IV 總數預覽
+        self.log("PART IV 預覽（各類別總數）：")
+        for k in "ABCDEFG":
+            self.log(f"  {k}：{after.get(k, 0)}")
+
+
+# ================= main =================
+
+if __name__ == "__main__":
+    try:
+        App().mainloop()
+    except Exception as e:
+        # 以免使用者雙擊執行遇到例外直接閃退
+        import traceback
+        root = tk.Tk(); root.withdraw()
+        messagebox.showerror("發生錯誤", f"{e}")
+        with open("error.log", "w", encoding="utf-8") as f:
+            f.write(traceback.format_exc())
