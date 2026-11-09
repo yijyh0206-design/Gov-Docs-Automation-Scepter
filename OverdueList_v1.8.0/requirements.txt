@@ -1,0 +1,4 @@
+pandas
+openpyxl
+# 選用：自動偵測 CSV 編碼
+chardet
